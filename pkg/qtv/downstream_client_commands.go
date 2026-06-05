@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/adam-lavrik/go-imath/i64"
@@ -40,6 +41,7 @@ func init() {
 		"lastscores":   {f: (*dStream).lastScoresClientCmd, sendAlias: true},
 		"follow":       {f: (*dStream).followClientCmd, sendAlias: true},
 		"qul":          {f: nil}, // We does not support user list update from the downstream - ignore it.
+		"pext":         {f: (*dStream).pextClientCmd},
 	}
 }
 
@@ -74,6 +76,54 @@ func (ds *dStream) executeClientCommand(cmd string) (err error) {
 	}
 	// Execute.
 	return c.f(ds, &tr)
+}
+
+// pextClientCmd handles the client's response to "cmd pext".
+// QTV uses this to learn whether this specific downstream can parse svc_spray.
+func (ds *dStream) pextClientCmd(tr *tokenizerResult) (err error) {
+	defer func() { err = multierror.Prefix(err, "dStream.pextClientCmd:") }()
+
+	// Serverdata and downstream encoding are written per viewer. Keep the
+	// intersection of what the upstream stream uses and what this client reported.
+	if ds.linkedUs == nil {
+		return nil
+	}
+
+	oldFTE1 := ds.extFlagsFTE1
+	oldFTE2 := ds.extFlagsFTE2
+	oldMVD1 := ds.extFlagsMVD1
+	ds.extFlagsFTE1 = 0
+	ds.extFlagsFTE2 = 0
+	ds.extFlagsMVD1 = 0
+	for i := 1; i+1 < tr.Argc(); i += 2 {
+		protocol, err := strconv.ParseUint(tr.Argv(i), 0, 32)
+		if err != nil {
+			continue
+		}
+		ext, err := strconv.ParseUint(tr.Argv(i+1), 0, 32)
+		if err != nil {
+			continue
+		}
+		switch uint32(protocol) {
+		case protocolVersionFTE:
+			ds.extFlagsFTE1 = uint32(ext) & ds.linkedUs.qp.extFlagsFTE1
+		case protocolVersionFTE2:
+			ds.extFlagsFTE2 = uint32(ext) & ds.linkedUs.qp.extFlagsFTE2
+		case protocolVersionMVD1:
+			ds.extFlagsMVD1 = uint32(ext) & mvdPext1Sprays
+		}
+	}
+
+	if oldFTE1 == ds.extFlagsFTE1 && oldFTE2 == ds.extFlagsFTE2 && oldMVD1 == ds.extFlagsMVD1 {
+		return nil
+	}
+	// The first serverdata normally goes out before the client answers pext.
+	// If spray support appears later, resend initial data so the client sees
+	// MVD_PEXT1_SPRAYS before QTV sends any spray payloads.
+	if ds.getState() > dsNeedInitialData {
+		return ds.setState(dsNeedInitialData)
+	}
+	return nil
 }
 
 // Specifies input type from downstream.

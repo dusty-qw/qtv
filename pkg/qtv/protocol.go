@@ -199,6 +199,10 @@ const (
 )
 
 const (
+	mvdPext1Sprays uint32 = (1 << 9) // Raw RGBA spray decal payloads.
+)
+
+const (
 	ftePextTrans        uint32 = 0x00000008 // Extra 8 bit with alpha in delta if changed
 	ftePextModelDbl     uint32 = 0x00001000 // Up to uint16 model indices
 	ftePextEntityDbl    uint32 = 0x00002000 // Up to 1024 entity indices
@@ -354,3 +358,5 @@ const (
 	svc_unused_83
 	svc_fte_voicechat
 )
+
+const svc_spray protocolSvc = 102

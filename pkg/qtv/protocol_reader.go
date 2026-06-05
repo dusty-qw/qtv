@@ -23,6 +23,9 @@ func (qp *qProtocol) readServerData() (err error) {
 	if err := qp.us.setState(usParsingConnection); err != nil {
 		return err
 	}
+	// Serverdata means a fresh upstream/map state. Any cached spray placements
+	// belong to the previous state and must not be replayed to new viewers.
+	qp.us.sprayPayloads = make(map[uint16][][]byte)
 
 	for {
 		protocol := qp.r.GetUint32()

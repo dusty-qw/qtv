@@ -65,6 +65,7 @@ type uStream struct {
 	hp                  uHeaderParse              // Initial headers handshake.
 	qp                  *qProtocol                // Quake protocol, we stored parsed data from upstream here, also used for generating quake protocol messages.
 	mvdHdr              *netMsgW                  // MVD header we use frequently for writing data to downstream(s).
+	sprayPayloads       map[uint16][][]byte       // Active spray payloads, replayed to spray-capable viewers on reconnect.
 	lastScores          [maxLastScores]lastScores // Lastscores data parsed from MVD stream.
 	lastScoresIndex     uint                      // Next Lastscored index.
 	updateUStreamInfoAt time.Time                 // Time when we willing to update upstream info next time.
@@ -103,6 +104,7 @@ func newUStream(qtv *QTV, ussNotifyCh chan<- interface{}, server string, ussName
 		rb:              ringbuffer.NewExtended(qtv.qvs.Get("ustream_read_buf_size").Int, false, true),   // Underlying buffer is two times more.
 		wb:              ringbuffer.NewExtended(qtv.qvs.Get("ustream_write_buf_size").Int, false, false), // Underlying buffer is two times more.
 		mvdHdr:          newNetMsgW(make([]byte, 16), false),
+		sprayPayloads:   make(map[uint16][][]byte),
 	}
 	us.qp = newQProtocol(us)
 

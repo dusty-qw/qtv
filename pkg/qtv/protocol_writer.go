@@ -8,17 +8,20 @@ func (qp *qProtocol) sendServerData(ds *dStream) error {
 	msg := qp.w.Clear()
 
 	msg.PutSVC(svc_serverdata)
-	if qp.extFlagsFTE1 != 0 {
+	if ds.extFlagsFTE1 != 0 {
 		msg.PutUint32(protocolVersionFTE)
-		msg.PutUint32(qp.extFlagsFTE1)
+		msg.PutUint32(ds.extFlagsFTE1)
 	}
-	if qp.extFlagsFTE2 != 0 {
+	if ds.extFlagsFTE2 != 0 {
 		msg.PutUint32(protocolVersionFTE2)
-		msg.PutUint32(qp.extFlagsFTE2)
+		msg.PutUint32(ds.extFlagsFTE2)
 	}
-	if qp.extFlagsMVD1 != 0 {
+	// MVD1 extensions are downstream-specific here. QTV consumes upstream hidden
+	// spray blocks itself, and only advertises spray support to clients that
+	// explicitly reported MVD_PEXT1_SPRAYS via cmd pext.
+	if ds.extFlagsMVD1 != 0 {
 		msg.PutUint32(protocolVersionMVD1)
-		msg.PutUint32(qp.extFlagsMVD1)
+		msg.PutUint32(ds.extFlagsMVD1)
 	}
 	msg.PutUint32(protocolVersion)
 	msg.PutUint32(qp.us.serverCount)
@@ -44,8 +47,8 @@ func (qp *qProtocol) sendServerData(ds *dStream) error {
 	return ds.sendMVDMessage(msg, mvdMsgRead, playersMaskAll)
 }
 
-func (qp *qProtocol) putList(msg *netMsgW, first int, list []string, svc protocolSvc, svcExtended protocolSvc) (i int) {
-	if first > 0xff {
+func (qp *qProtocol) putList(msg *netMsgW, first int, list []string, svc protocolSvc, svcExtended protocolSvc, useExtended bool) (i int) {
+	if first > 0xff && useExtended {
 		msg.PutSVC(svcExtended)
 		msg.PutUint16(uint16(first))
 	} else {
@@ -54,6 +57,10 @@ func (qp *qProtocol) putList(msg *netMsgW, first int, list []string, svc protoco
 	}
 
 	for i = first + 1; i < len(list); i++ {
+		if !useExtended && i > 0xff {
+			msg.PutByte(0)
+			return -1
+		}
 		msg.PutString(list[i])
 		if list[i] == "" {
 			msg.PutByte(0)
@@ -76,7 +83,8 @@ func (qp *qProtocol) putList(msg *netMsgW, first int, list []string, svc protoco
 func (qp *qProtocol) sendList(ds *dStream, list []string, svc protocolSvc, svcExtended protocolSvc) error {
 	for prespawn := 0; prespawn >= 0; {
 		msg := qp.w.Clear()
-		prespawn = qp.putList(msg, prespawn, list, svc, svcExtended)
+		useExtended := svcExtended == svc_fte_modellistshort && (ds.extFlagsFTE1&ftePextModelDbl) != 0
+		prespawn = qp.putList(msg, prespawn, list, svc, svcExtended, useExtended)
 		if err := ds.sendMVDMessage(msg, mvdMsgRead, playersMaskAll); err != nil {
 			return err
 		}
@@ -131,7 +139,7 @@ func (qp *qProtocol) putEntityState(msg *netMsgW, es *entityState) {
 	}
 }
 
-func (qp *qProtocol) putBaseLines(msg *netMsgW, cursize int, maxbuffersize int, i int) int {
+func (qp *qProtocol) putBaseLines(msg *netMsgW, cursize int, maxbuffersize int, i int, fteFlags uint32) int {
 	if i < 0 || i >= maxEntities {
 		return i
 	}
@@ -142,9 +150,9 @@ func (qp *qProtocol) putBaseLines(msg *netMsgW, cursize int, maxbuffersize int, 
 		}
 
 		if qp.baseLine[i].modelIndex != 0 {
-			if (qp.extFlagsFTE1 & ftePextSpawnStatic2) != 0 {
+			if (fteFlags & ftePextSpawnStatic2) != 0 {
 				msg.PutSVC(svc_fte_spawnbaseline2)
-				qp.putDelta(msg, i, &nullEntityState, &qp.baseLine[i], true)
+				qp.putDelta(msg, i, &nullEntityState, &qp.baseLine[i], true, fteFlags)
 			} else {
 				msg.PutSVC(svc_spawnbaseline)
 				msg.PutUint16(uint16(i))
@@ -197,7 +205,7 @@ func (qp *qProtocol) putStaticSounds(msg *netMsgW, cursize int, maxbuffersize in
 	return i
 }
 
-func (qp *qProtocol) putStaticEntities(msg *netMsgW, cursize int, maxbuffersize int, i int) int {
+func (qp *qProtocol) putStaticEntities(msg *netMsgW, cursize int, maxbuffersize int, i int, fteFlags uint32) int {
 	if i < 0 || i >= maxStaticEntities {
 		return i
 	}
@@ -210,9 +218,9 @@ func (qp *qProtocol) putStaticEntities(msg *netMsgW, cursize int, maxbuffersize 
 			continue
 		}
 
-		if (qp.extFlagsFTE1 & ftePextSpawnStatic2) != 0 {
+		if (fteFlags & ftePextSpawnStatic2) != 0 {
 			msg.PutSVC(svc_fte_spawnstatic2)
-			qp.putDelta(msg, i, &nullEntityState, &qp.spawnStatic[i], true)
+			qp.putDelta(msg, i, &nullEntityState, &qp.spawnStatic[i], true, fteFlags)
 		} else {
 			msg.PutSVC(svc_spawnstatic)
 			qp.putEntityState(msg, &qp.spawnStatic[i])
@@ -223,7 +231,7 @@ func (qp *qProtocol) putStaticEntities(msg *netMsgW, cursize int, maxbuffersize 
 }
 
 // Returns the next putPreSpawn 'buffer' number to use, or -1 if no more.
-func (qp *qProtocol) putPreSpawn(msg *netMsgW, curmsgsize int, bufnum int) int {
+func (qp *qProtocol) putPreSpawn(msg *netMsgW, curmsgsize int, bufnum int, fteFlags uint32) int {
 	r := bufnum
 
 	ni := qp.putUserInfos(msg, curmsgsize, 768, bufnum)
@@ -231,7 +239,7 @@ func (qp *qProtocol) putPreSpawn(msg *netMsgW, curmsgsize int, bufnum int) int {
 	bufnum = ni
 	bufnum -= maxClients
 
-	ni = qp.putBaseLines(msg, curmsgsize, 768, bufnum)
+	ni = qp.putBaseLines(msg, curmsgsize, 768, bufnum, fteFlags)
 	r += ni - bufnum
 	bufnum = ni
 	bufnum -= maxEntities
@@ -246,7 +254,7 @@ func (qp *qProtocol) putPreSpawn(msg *netMsgW, curmsgsize int, bufnum int) int {
 	bufnum = ni
 	bufnum -= maxStaticSounds
 
-	ni = qp.putStaticEntities(msg, curmsgsize, 768, bufnum)
+	ni = qp.putStaticEntities(msg, curmsgsize, 768, bufnum, fteFlags)
 	r += ni - bufnum
 	bufnum = ni
 	bufnum -= maxStaticEntities
@@ -261,7 +269,7 @@ func (qp *qProtocol) putPreSpawn(msg *netMsgW, curmsgsize int, bufnum int) int {
 func (qp *qProtocol) sendPreSpawn(ds *dStream) error {
 	for prespawn := 0; prespawn >= 0; {
 		msg := qp.w.Clear()
-		prespawn = qp.putPreSpawn(msg, 0, prespawn)
+		prespawn = qp.putPreSpawn(msg, 0, prespawn, ds.extFlagsFTE1)
 		if err := ds.sendMVDMessage(msg, mvdMsgRead, playersMaskAll); err != nil {
 			return err
 		}
@@ -269,14 +277,14 @@ func (qp *qProtocol) sendPreSpawn(ds *dStream) error {
 	return nil
 }
 
-func (qp *qProtocol) putDelta(msg *netMsgW, entnum int, from *entityState, to *entityState, force bool) {
+func (qp *qProtocol) putDelta(msg *netMsgW, entnum int, from *entityState, to *entityState, force bool, fteFlags uint32) {
 	bits := 0
 
 	evenMoreBits := 0
 
 	if from.modelIndex != to.modelIndex {
 		bits |= uModel
-		if (qp.extFlagsFTE1 & ftePextModelDbl) != 0 {
+		if (fteFlags & ftePextModelDbl) != 0 {
 			if to.modelIndex > 255 {
 				if to.modelIndex > 512 {
 					bits &= ^uModel
@@ -318,17 +326,17 @@ func (qp *qProtocol) putDelta(msg *netMsgW, entnum int, from *entityState, to *e
 		bits |= uEffects
 	}
 
-	if (qp.extFlagsFTE1 & ftePextTrans) != 0 {
+	if (fteFlags & ftePextTrans) != 0 {
 		if to.trans != from.trans {
 			evenMoreBits |= uFteTrans
 		}
 	}
-	if (qp.extFlagsFTE1 & ftePextColourmod) != 0 {
+	if (fteFlags & ftePextColourmod) != 0 {
 		if to.colourmod[0] != from.colourmod[0] || to.colourmod[1] != from.colourmod[1] || to.colourmod[2] != from.colourmod[2] {
 			evenMoreBits |= uFteColourMod
 		}
 	}
-	if (qp.extFlagsFTE1&ftePextEntityDbl) != 0 && (qp.extFlagsFTE1&ftePextEntityDbl2) != 0 {
+	if (fteFlags&ftePextEntityDbl) != 0 && (fteFlags&ftePextEntityDbl2) != 0 {
 		if entnum >= 512 {
 			if entnum >= 1024 {
 				if entnum >= (1024 + 512) {
@@ -421,7 +429,7 @@ func (qp *qProtocol) sendEnts(ds *dStream) error {
 	frame := &qp.frame[qp.incomingSequence&(maxEntityFrames-1)]
 	for i := 0; i < frame.numEnts; i++ {
 		entnum := frame.entNums[i]
-		qp.putDelta(msg, int(entnum), &qp.baseLine[entnum], &frame.ents[i], true)
+		qp.putDelta(msg, int(entnum), &qp.baseLine[entnum], &frame.ents[i], true, ds.extFlagsFTE1)
 	}
 	msg.PutUint16(0)
 

@@ -97,9 +97,192 @@ const (
 	mvdhidden_usercmd_weapon_instruction uint16 = 0x0009
 	// <byte: msec> ... actual time elapsed, not gametime (can be used to keep stream running) ... expected to be QTV only
 	mvdhidden_paused_duration uint16 = 0x000A
+	// spraynet_* payload, without svc_spray byte.
+	mvdhidden_spray uint16 = 0x000C
 	// doubt we'll ever get here: read next short...
 	mvdhidden_extended uint16 = 0xFFFF
 )
+
+const (
+	spraynetBegin       byte = 0
+	spraynetPixels      byte = 1
+	spraynetClearAll    byte = 4
+	spraynetClearOne    byte = 5
+	spraynetBeginSilent byte = 6
+)
+
+// copySprayPayload detaches cached spray payloads from the upstream read buffer.
+// The source slice is reused while parsing MVD data, so cached data must own its bytes.
+func copySprayPayload(payload []byte) []byte {
+	out := make([]byte, len(payload))
+	copy(out, payload)
+	return out
+}
+
+// Backfilled sprays should render silently for late-joining viewers. Convert
+// normal begin payloads to begin_silent while preserving the rest of the payload.
+func copySprayBackfillPayload(payload []byte) []byte {
+	out := copySprayPayload(payload)
+	if len(out) > 0 && out[0] == spraynetBegin {
+		out[0] = spraynetBeginSilent
+	}
+	return out
+}
+
+// All spraynet payloads that refer to a decal carry the server-assigned spray id
+// immediately after the opcode. Clear-all has no id and is handled separately.
+func sprayPayloadID(payload []byte) (uint16, bool) {
+	if len(payload) < 3 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint16(payload[1:3]), true
+}
+
+// rememberSprayPayload tracks the current spray table as QTV observes hidden
+// spray blocks from MVDSV. This cache is what lets QTV replay existing sprays
+// to supported viewers that connect after the sprays were originally placed.
+func (us *uStream) rememberSprayPayload(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+
+	switch payload[0] {
+	case spraynetBegin, spraynetBeginSilent:
+		id, ok := sprayPayloadID(payload)
+		if !ok {
+			return
+		}
+		// A begin payload starts or replaces one server spray id, so discard any
+		// old chunks stored for that id before recording the new self-contained set.
+		us.sprayPayloads[id] = [][]byte{copySprayBackfillPayload(payload)}
+	case spraynetPixels:
+		id, ok := sprayPayloadID(payload)
+		if !ok {
+			return
+		}
+		if _, ok := us.sprayPayloads[id]; !ok {
+			return
+		}
+		// Pixel chunks follow begin in order. Store each chunk so backfill can
+		// reconstruct the image for clients that do not already have this hash.
+		us.sprayPayloads[id] = append(us.sprayPayloads[id], copySprayPayload(payload))
+	case spraynetClearOne:
+		id, ok := sprayPayloadID(payload)
+		if ok {
+			delete(us.sprayPayloads, id)
+		}
+	case spraynetClearAll:
+		us.sprayPayloads = make(map[uint16][][]byte)
+	}
+}
+
+// sendSprayPayload wraps one spraynet payload in svc_spray for a downstream
+// client that has negotiated MVD_PEXT1_SPRAYS support.
+func (us *uStream) sendSprayPayload(ds *dStream, payload []byte) error {
+	if (ds.extFlagsMVD1 & mvdPext1Sprays) == 0 {
+		return nil
+	}
+
+	msg := newNetMsgW(make([]byte, len(payload)+1), false)
+	msg.PutSVC(svc_spray)
+	msg.PutData(payload)
+	return ds.sendMVDMessageEx(msg, mvdMsgRead, playersMaskAll, defaultCheckAvail, 0)
+}
+
+// sendSprayBackfill replays the currently active spray table to one downstream.
+// Payloads are cached as silent backfill data, so old sprays do not play sounds.
+func (us *uStream) sendSprayBackfill(ds *dStream) error {
+	if (ds.extFlagsMVD1 & mvdPext1Sprays) == 0 {
+		return nil
+	}
+
+	for _, payloads := range us.sprayPayloads {
+		for _, payload := range payloads {
+			err := us.sendSprayPayload(ds, payload)
+			if errors.Is(err, errCheckAvail) {
+				// Spray backfill is opportunistic. If this downstream's write buffer is already
+				// tight during initial data, leave the viewer connected rather than failing the
+				// whole reconnect path because cached decals could not be replayed immediately.
+				log.Trace().Err(multierror.Prefix(err, "uStream.sendSprayBackfill:")).Msg("")
+				continue
+			} else if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// forwardSprayPayload updates QTV's active spray cache, then forwards the live
+// payload to already-active downstreams that can parse svc_spray.
+func (us *uStream) forwardSprayPayload(payload []byte) error {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	us.rememberSprayPayload(payload)
+
+	for _, ds := range us.linkedDs {
+		if ds.getState() != dsActive {
+			continue
+		}
+		if err := us.sendSprayPayload(ds, payload); err != nil {
+			if errors.Is(err, errCheckAvail) {
+				log.Trace().Err(multierror.Prefix(err, "uStream.forwardSprayPayload:")).Msg("")
+				continue
+			}
+			ds.cancel()
+		}
+	}
+	return nil
+}
+
+// handleHiddenMVDMessages parses dem_multiple(0) hidden blocks. Most hidden
+// block types stay internal to QTV or are ignored here; spray blocks are
+// translated back into normal svc_spray messages for supported clients.
+func (us *uStream) handleHiddenMVDMessages(b []byte) error {
+	for len(b) > 0 {
+		if len(b) < 6 {
+			return errors.New("corrupted hidden MVD stream")
+		}
+
+		length := int(binary.LittleEndian.Uint32(b[:4]))
+		typeID := binary.LittleEndian.Uint16(b[4:6])
+		header := 6
+		if typeID == mvdhidden_extended {
+			if len(b) < 8 {
+				return errors.New("corrupted hidden MVD stream")
+			}
+			typeID = binary.LittleEndian.Uint16(b[6:8])
+			header = 8
+		}
+		if length < 0 {
+			return errors.New("corrupted hidden MVD stream")
+		}
+
+		payloadEnd := header + length
+		blockEnd := payloadEnd
+		if payloadEnd > len(b) {
+			// Most MVDSV hidden blocks store length as payload bytes after the
+			// hidden header. Older QTV-only blocks, such as paused_duration, used
+			// a length that included the type id. Accept both so unrelated hidden
+			// metadata cannot corrupt the downstream stream.
+			blockEnd = 4 + length
+			if blockEnd < header || blockEnd > len(b) {
+				return errors.New("corrupted hidden MVD stream")
+			}
+			payloadEnd = blockEnd
+		}
+
+		payload := b[header:payloadEnd]
+		if typeID == mvdhidden_spray {
+			if err := us.forwardSprayPayload(payload); err != nil {
+				return err
+			}
+		}
+		b = b[blockEnd:]
+	}
+	return nil
+}
 
 // mvdhidden_paused_duration(msec) embedded in dem_multiple(0) packet
 // used to tell us how much elapsed time has gone by when paused
@@ -398,6 +581,8 @@ func (us *uStream) parseMVDMessage(b []byte, demoSpeed float64, isLowLatency boo
 			if err := us.qp.readMessage(mb[:length], messageType, playersMask); err != nil {
 				return true, 0, 0, err
 			}
+		} else if err := us.handleHiddenMVDMessages(mb[:length]); err != nil {
+			return true, 0, 0, err
 		}
 	case mvdMsgSingle, mvdMsgStats:
 		playernum := (b[1] >> 3) // These are directed to a single player.
@@ -478,6 +663,14 @@ func (us *uStream) sendInitialMVDData_EzqExt(ds *dStream) (err error) {
 	if err := us.qp.sendServerData(ds); err != nil {
 		return err
 	}
+	if err := us.qp.sendStuffTextf(ds, "cmd pext\n"); err != nil {
+		return err
+	}
+	// If this is the second initial-data pass after the client answered pext,
+	// send the active spray table now. Unsupported clients simply no-op here.
+	if err := us.sendSprayBackfill(ds); err != nil {
+		return err
+	}
 	if err := ds.sendClientAliases(); err != nil {
 		return err
 	}
@@ -489,6 +682,14 @@ func (us *uStream) sendInitialMVDData_1_0(ds *dStream) (err error) {
 	defer func() { err = multierror.Prefix(err, "uStream.sendInitialMVDData_1_0:") }()
 
 	if err := us.qp.sendServerData(ds); err != nil {
+		return err
+	}
+	if err := us.qp.sendStuffTextf(ds, "cmd pext\n"); err != nil {
+		return err
+	}
+	// If this is the second initial-data pass after the client answered pext,
+	// send the active spray table now. Unsupported clients simply no-op here.
+	if err := us.sendSprayBackfill(ds); err != nil {
 		return err
 	}
 	if err := us.qp.sendList(ds, us.qp.soundList[:], svc_soundlist, svc_fte_soundlistshort_UNUSED); err != nil {

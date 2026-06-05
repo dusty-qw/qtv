@@ -39,6 +39,9 @@ type dStream struct {
 	wb                   *ringbuffer.RingBuffer // Output buffer to downstream.
 	headers              map[string]string      // Initial handshake headers.
 	qtvEzQuakeExt        uint32                 // ezQuake extensions mask this downstream support.
+	extFlagsFTE1         uint32                 // FTE protocol extensions advertised by this downstream client.
+	extFlagsFTE2         uint32                 // FTE2 protocol extensions advertised by this downstream client.
+	extFlagsMVD1         uint32                 // MVDSV protocol extensions advertised by this downstream client.
 	authChallenge        []byte                 // Auth challenge used for this downstream (if any).
 	flushAndExit         bool                   // True when we have to flush output buffer before closing connection.
 	flushData            *strings.Reader        // Extra data we have to flush besides output buffer.
